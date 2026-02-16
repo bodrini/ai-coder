@@ -11,8 +11,10 @@ dotenv.config();
 const execAsync = promisify(exec);
 
 // 1. НАСТРОЙКА GEMINI
+// Используем указанную тобой модель. 
+// (Если упадет с 404, поменяй на 'gemini-1.5-flash')
 const geminiCoder = new ChatGoogleGenerativeAI({
-  model: "gemini-2.5-flash",
+  model: "gemini-2.5-flash", 
   apiKey: process.env.GEMINI_API_KEY,
   temperature: 0.1,
 });
@@ -22,6 +24,7 @@ export async function executorNode(state: typeof AgentState.State) {
 
   const currentPlan = state.plan;
 
+  // Если плана нет - выходим
   if (!currentPlan || currentPlan.length === 0) {
     return { plan: [] };
   }
@@ -29,99 +32,133 @@ export async function executorNode(state: typeof AgentState.State) {
   const taskJson = currentPlan[0];
   const task = JSON.parse(taskJson);
 
-  // Получаем рабочую папку из стейта
+  // Получаем рабочую папку, контекст и счетчик попыток
   const workingDirectory = state.workDir;
+  const currentContext = state.context || ""; 
+  const currentRetries = state.retryCount || 0; // <--- Важно для счетчика
+  
+  let newContextData = "";
+  let resultOutput = ""; // Объявляем один раз
 
-  // Проверка на случай, если путь не передан
   if (!workingDirectory) {
-    console.error("❌ Ошибка: Не указана рабочая директория (workDir)!");
-    return { plan: [], currentCode: "Error: No workDir" };
+    return { plan: [], error: "Critical: No workDir provided" };
   }
 
   console.log(`🚀 Задача: ${task.action} -> ${task.file} [${task.tool}]`);
-  console.log(`📂 В папке: ${workingDirectory}`);
-
-  let resultOutput = "";
-
+  
   try {
     // --- ВЕТКА A: ТЕРМИНАЛ ---
     if (task.tool === "terminal") {
-      // ВАЖНО: Добавлена опция { cwd: workingDirectory }
-      // Теперь команды выполняются внутри папки проекта, а не внутри агента
       
-      if (task.action === "test") {
-        console.log("🖥️ Запускаю тесты...");
-        const { stdout, stderr } = await execAsync("npm test", { cwd: workingDirectory });
-        resultOutput = stdout || stderr;
-      } else if (task.action === "build") {
-        console.log("📦 Запускаю сборку...");
-        const { stdout } = await execAsync("npm run build", { cwd: workingDirectory });
+      try {
+        const command = task.action === "test" ? "npm test" 
+                      : task.action === "build" ? "npm run build" 
+                      : task.description;
+
+        console.log(`🖥️ Exec: ${command}`);
+        const { stdout } = await execAsync(command, { cwd: workingDirectory });
         resultOutput = stdout;
-      } else {
-        // Выполнение произвольной команды из description
-        const { stdout, stderr } = await execAsync(task.description, { cwd: workingDirectory });
-        resultOutput = stdout || stderr;
+
+      } catch (cmdError: any) {
+        // 🛑 ОШИБКА КОМАНДЫ
+        console.error("💥 ОШИБКА В ТЕРМИНАЛЕ! (+1 к попыткам)");
+        return {
+          plan: [], 
+          error: `Ошибка выполнения команды '${task.description}': ${cmdError.message || cmdError.stderr}`,
+          context: newContextData,
+          // 🔥 ИНКРЕМЕНТ: Увеличиваем счетчик ошибок
+          retryCount: currentRetries + 1
+        };
       }
 
-    // --- ВЕТКА B: GEMINI (КОДЕР) ---
+    // --- ВЕТКА B: GEMINI ---
     } else if (task.tool === "gemini") {
       
       const fullFilePath = path.join(workingDirectory, task.file);
 
-      let fileContent = "";
-      try {
-        if (fs.existsSync(fullFilePath)) {
-           fileContent = fs.readFileSync(fullFilePath, 'utf-8');
-        }
-      } catch (e) { console.log("Файл новый."); }
-
-      const prompt = `
-        Ты - Vue 3 Эксперт.
-        ЗАДАЧА: ${task.description}
-        ФАЙЛ: ${task.file}
-        
-        ТЕКУЩИЙ КОД:
-        \`\`\`vue
-        ${fileContent}
-        \`\`\`
-
-        ТРЕБОВАНИЯ:
-        1. Верни ПОЛНЫЙ валидный код файла.
-        2. НЕ пиши никаких объяснений. Только код внутри блока кода.
-        3. Используй <script setup lang="ts">.
-      `;
-
-      const response = await geminiCoder.invoke(prompt);
-      const rawText = response.content as string;
-
-      // Очистка
-      resultOutput = rawText
-        .replace(/```vue/g, "")
-        .replace(/```html/g, "")
-        .replace(/```typescript/g, "")
-        .replace(/```ts/g, "")
-        .replace(/```/g, "")
-        .trim();
-
-      if (task.action === "edit" || task.action === "create") {
-          // Гарантируем, что папка существует перед записью
-          const dir = path.dirname(fullFilePath);
-          if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
+      // 1. READ
+      if (task.action === "read") {
+        console.log(`👀 Читаю файл: ${task.file}`);
+        try {
+          if (fs.existsSync(fullFilePath)) {
+            const content = fs.readFileSync(fullFilePath, 'utf-8');
+            resultOutput = `Файл прочитан.`;
+            newContextData = `\n=== КОНТЕКСТ ФАЙЛА ${task.file} ===\n${content}\n`;
+          } else {
+            resultOutput = `Файл ${task.file} не найден.`;
+            console.log("⚠️ Файл не найден.");
           }
+        } catch (e) {
+          resultOutput = `Ошибка чтения: ${e}`;
+        }
+      }
 
-          fs.writeFileSync(fullFilePath, resultOutput);
-          console.log(`✅ Файл сохранен: ${fullFilePath}`);
+      // 2. EDIT / CREATE
+      else if (task.action === "edit" || task.action === "create") {
+        
+        let fileContent = "";
+        try {
+          if (fs.existsSync(fullFilePath)) {
+             fileContent = fs.readFileSync(fullFilePath, 'utf-8');
+          }
+        } catch (e) { console.log("Файл новый."); }
+
+        const prompt = `
+          Ты - Vue 3 Эксперт.
+          ЗАДАЧА: ${task.description}
+          ФАЙЛ: ${task.file}
+          
+          🧠 КОНТЕКСТ ПРОЕКТА:
+          ${currentContext}
+          
+          ТЕКУЩИЙ КОД:
+          \`\`\`vue
+          ${fileContent}
+          \`\`\`
+
+          ТРЕБОВАНИЯ:
+          1. Верни ПОЛНЫЙ валидный код файла.
+          2. Только код.
+          3. <script setup lang="ts">.
+        `;
+
+        const response = await geminiCoder.invoke(prompt);
+        const rawText = response.content as string;
+
+        resultOutput = rawText
+          .replace(/```vue/g, "")
+          .replace(/```html/g, "")
+          .replace(/```typescript/g, "")
+          .replace(/```ts/g, "")
+          .replace(/```/g, "")
+          .trim();
+
+        const dir = path.dirname(fullFilePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+        fs.writeFileSync(fullFilePath, resultOutput);
+        console.log(`✅ Файл сохранен: ${fullFilePath}`);
       }
     }
 
-  } catch (error) {
-    console.error(`❌ Ошибка выполнения: ${error}`);
-    resultOutput = `Error: ${error}`;
+  } catch (error: any) {
+    // 🛑 ГЛОБАЛЬНАЯ ОШИБКА (API и т.д.)
+    console.error(`❌ Критическая ошибка Исполнителя: ${error}`);
+    return {
+      plan: [],
+      error: `System Error: ${error.message || String(error)}`,
+      // 🔥 ИНКРЕМЕНТ
+      retryCount: currentRetries + 1
+    };
   }
 
+  // ✅ УСПЕХ
   return {
     plan: currentPlan.slice(1),
-    currentCode: resultOutput
+    currentCode: resultOutput,
+    context: newContextData,
+    error: "", 
+    // 🔥 СБРОС: Если шаг успешен, обнуляем счетчик
+    retryCount: 0 
   };
 }

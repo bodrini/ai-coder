@@ -7,4 +7,13 @@ export const AgentState = Annotation.Root({
   plan: Annotation<string[]>(),    // Список шагов, который он составил
   currentCode: Annotation<string>(), // Код, с которым работаем сейчас
   workDir: Annotation<string>(),   // <-- Путь к папке, которую мы редактируем
+  context: Annotation<string>({
+    reducer: (current, update) => current + "\n\n" + update,
+    default: () => "",
+  }),
+  error: Annotation<string>(),
+  retryCount: Annotation<number>({
+    reducer: (current, update) => update,
+    default: () => 0,
+  }),
 }); 
