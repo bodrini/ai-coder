@@ -5,14 +5,13 @@ import fs from "fs";
 import { AgentState } from "../state";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import * as dotenv from "dotenv";
+import { loadPrompt } from "../utils/promptLoader"; // 1. Импортируем загрузчик
 
 dotenv.config();
 
 const execAsync = promisify(exec);
 
-// 1. НАСТРОЙКА GEMINI
-// Используем указанную тобой модель. 
-// (Если упадет с 404, поменяй на 'gemini-1.5-flash')
+// НАСТРОЙКА GEMINI
 const geminiCoder = new ChatGoogleGenerativeAI({
   model: "gemini-2.5-flash", 
   apiKey: process.env.GEMINI_API_KEY,
@@ -24,7 +23,6 @@ export async function executorNode(state: typeof AgentState.State) {
 
   const currentPlan = state.plan;
 
-  // Если плана нет - выходим
   if (!currentPlan || currentPlan.length === 0) {
     return { plan: [] };
   }
@@ -32,13 +30,12 @@ export async function executorNode(state: typeof AgentState.State) {
   const taskJson = currentPlan[0];
   const task = JSON.parse(taskJson);
 
-  // Получаем рабочую папку, контекст и счетчик попыток
   const workingDirectory = state.workDir;
   const currentContext = state.context || ""; 
-  const currentRetries = state.retryCount || 0; // <--- Важно для счетчика
+  const currentRetries = state.retryCount || 0;
   
   let newContextData = "";
-  let resultOutput = ""; // Объявляем один раз
+  let resultOutput = ""; 
 
   if (!workingDirectory) {
     return { plan: [], error: "Critical: No workDir provided" };
@@ -49,7 +46,6 @@ export async function executorNode(state: typeof AgentState.State) {
   try {
     // --- ВЕТКА A: ТЕРМИНАЛ ---
     if (task.tool === "terminal") {
-      
       try {
         const command = task.action === "test" ? "npm test" 
                       : task.action === "build" ? "npm run build" 
@@ -60,13 +56,11 @@ export async function executorNode(state: typeof AgentState.State) {
         resultOutput = stdout;
 
       } catch (cmdError: any) {
-        // 🛑 ОШИБКА КОМАНДЫ
         console.error("💥 ОШИБКА В ТЕРМИНАЛЕ! (+1 к попыткам)");
         return {
           plan: [], 
           error: `Ошибка выполнения команды '${task.description}': ${cmdError.message || cmdError.stderr}`,
           context: newContextData,
-          // 🔥 ИНКРЕМЕНТ: Увеличиваем счетчик ошибок
           retryCount: currentRetries + 1
         };
       }
@@ -76,7 +70,7 @@ export async function executorNode(state: typeof AgentState.State) {
       
       const fullFilePath = path.join(workingDirectory, task.file);
 
-      // 1. READ
+      // 1. READ (Чтение)
       if (task.action === "read") {
         console.log(`👀 Читаю файл: ${task.file}`);
         try {
@@ -93,7 +87,7 @@ export async function executorNode(state: typeof AgentState.State) {
         }
       }
 
-      // 2. EDIT / CREATE
+      // 2. EDIT / CREATE (Изменение кода)
       else if (task.action === "edit" || task.action === "create") {
         
         let fileContent = "";
@@ -103,28 +97,18 @@ export async function executorNode(state: typeof AgentState.State) {
           }
         } catch (e) { console.log("Файл новый."); }
 
-        const prompt = `
-          Ты - Vue 3 Эксперт.
-          ЗАДАЧА: ${task.description}
-          ФАЙЛ: ${task.file}
-          
-          🧠 КОНТЕКСТ ПРОЕКТА:
-          ${currentContext}
-          
-          ТЕКУЩИЙ КОД:
-          \`\`\`vue
-          ${fileContent}
-          \`\`\`
-
-          ТРЕБОВАНИЯ:
-          1. Верни ПОЛНЫЙ валидный код файла.
-          2. Только код.
-          3. <script setup lang="ts">.
-        `;
+        // 2. ЗАГРУЖАЕМ ПРОМПТ ИЗ ФАЙЛА executor.md
+        const prompt = loadPrompt("executor.md", {
+            description: task.description,
+            file: task.file,
+            context: currentContext,
+            fileContent: fileContent
+        });
 
         const response = await geminiCoder.invoke(prompt);
         const rawText = response.content as string;
 
+        // Очистка от маркдауна (```vue и т.д.)
         resultOutput = rawText
           .replace(/```vue/g, "")
           .replace(/```html/g, "")
@@ -133,21 +117,21 @@ export async function executorNode(state: typeof AgentState.State) {
           .replace(/```/g, "")
           .trim();
 
+        // Создаем папку, если её нет
         const dir = path.dirname(fullFilePath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
+        // Записываем файл
         fs.writeFileSync(fullFilePath, resultOutput);
         console.log(`✅ Файл сохранен: ${fullFilePath}`);
       }
     }
 
   } catch (error: any) {
-    // 🛑 ГЛОБАЛЬНАЯ ОШИБКА (API и т.д.)
     console.error(`❌ Критическая ошибка Исполнителя: ${error}`);
     return {
       plan: [],
       error: `System Error: ${error.message || String(error)}`,
-      // 🔥 ИНКРЕМЕНТ
       retryCount: currentRetries + 1
     };
   }
@@ -158,7 +142,6 @@ export async function executorNode(state: typeof AgentState.State) {
     currentCode: resultOutput,
     context: newContextData,
     error: "", 
-    // 🔥 СБРОС: Если шаг успешен, обнуляем счетчик
     retryCount: 0 
   };
 }
