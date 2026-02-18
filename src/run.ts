@@ -6,6 +6,10 @@ import { setupLogger } from "./agent/utils/logger";
 
 dotenv.config();
 
+function getHistoryPath(targetFolder: string) {
+  return path.join(targetFolder, ".agent", "history.md");
+}
+
 async function main() {
 
   setupLogger();
@@ -21,6 +25,14 @@ async function main() {
 
   // 2. Читаем задачу из файла
   const userTask = fs.readFileSync(taskFilePath, "utf-8").trim();
+
+  const historyFile = getHistoryPath(targetFolder);
+  let projectHistory = "Это первый запуск агента.";
+
+  if (fs.existsSync(historyFile)) {
+    projectHistory = fs.readFileSync(historyFile, "utf-8");
+    console.log("🧠 История проекта загружена.");
+  }
 
   if (!userTask) {
     console.error("❌ Ошибка: Файл task.md пустой!");
@@ -38,12 +50,28 @@ async function main() {
     task: userTask, // <-- Передаем содержимое файла
     plan: [],
     files: [],
-    retryCount: 0
+    retryCount: 0,
+    memory: projectHistory, // Загружаем историю проекта, если она есть
   };
 
   try {
     const result = await app.invoke(inputs);
+
+    // 4. ЕСЛИ УСПЕХ -> СОХРАНЯЕМ В ИСТОРИЮ
+    console.log("\n💾 Сохраняю результат в память...");
+    
+    const agentDir = path.dirname(historyFile);
+    if (!fs.existsSync(agentDir)) {
+      fs.mkdirSync(agentDir, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().split('T')[0];
+    const newEntry = `\n## [${timestamp}] Задача\n${userTask}\nStatus: ✅ Completed\n`;
+
+    fs.appendFileSync(historyFile, newEntry);
+    console.log(`✅ История обновлена: ${historyFile}`); 
     console.log("\n🏁 Готово! Агент завершил работу.");
+
   } catch (error) {
     console.error("\n💥 Произошла ошибка при выполнении:", error);
   }
