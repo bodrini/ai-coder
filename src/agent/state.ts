@@ -16,4 +16,8 @@ export const AgentState = Annotation.Root({
     reducer: (current, update) => update,
     default: () => 0,
   }),
+  memory: Annotation<string>({
+    reducer: (current, update) => update, // Просто перезаписываем при старте
+    default: () => "История пуста.",
+  }),
 }); 

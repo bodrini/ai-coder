@@ -71,7 +71,7 @@ export async function plannerNode(state: typeof AgentState.State) {
   }
 
   // --- ШАГ B: Обработка ошибок (Self-Healing) ---
-  const { error, task } = state;
+  const { error, task, memory } = state;
   let currentTask = task; // По умолчанию делаем то, что просил юзер
   
   if (error) {
@@ -103,8 +103,9 @@ export async function plannerNode(state: typeof AgentState.State) {
   // Загружаем текст из prompts/planner.md и подставляем переменные
   const prompt = loadPrompt("planner.md", {
     workDir: targetPath,
-    files: filesInProject.join(", ") || "Нет файлов (пустой проект)",
-    task: currentTask // <-- Сюда попадает либо задача юзера, либо задача исправления
+    files: filesInProject.join(", ") || "Нет файлов",
+    task: currentTask,
+    memory: memory || "История пуста." // <--- Передаем в шаблон
   });
 
   try {
