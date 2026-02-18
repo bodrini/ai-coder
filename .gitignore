@@ -6,3 +6,4 @@ build/
 .env
 .DS_Store
 task.md
+logs/

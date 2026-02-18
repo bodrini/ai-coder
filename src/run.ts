@@ -2,11 +2,13 @@ import { app } from "./agent/index";
 import path from "path";
 import fs from "fs";
 import * as dotenv from "dotenv";
+import { setupLogger } from "./agent/utils/logger";
 
 dotenv.config();
 
 async function main() {
 
+  setupLogger();
   const targetFolder = process.env.TARGET_PROJECT_PATH || process.cwd();
   const taskFilePath = path.join(process.cwd(), "task.md");
 
