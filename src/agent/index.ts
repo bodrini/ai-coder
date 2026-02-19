@@ -1,4 +1,4 @@
-import { StateGraph, START, END } from "@langchain/langgraph";
+import { StateGraph, START, END, MemorySaver } from "@langchain/langgraph";
 import { AgentState } from "./state";
 import { plannerNode } from "./nodes/plannerNode";
 import { executorNode } from "./nodes/executorNode";
@@ -43,4 +43,10 @@ const workflow = new StateGraph(AgentState)
     ["planner", "executor", END]
   );
 
-export const app = workflow.compile();
+  const checkpointer = new MemorySaver();
+
+  // 3. Компилируем с прерыванием ПЕРЕД исполнителем
+  export const app = workflow.compile({
+    checkpointer, // Подключаем память
+    interruptBefore: ["executor"] // 🛑 Граф встанет на паузу ПЕРЕД этим узлом
+  });
