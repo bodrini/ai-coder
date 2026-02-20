@@ -2,10 +2,10 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
 import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/huggingface_transformers";
+import { loadAgentConfig } from "./configLoader"; // 👈 ИМПОРТ КОНФИГА
 
 // Типы для нашего локального кэша
 interface CacheEntry {
@@ -19,13 +19,12 @@ interface CacheEntry {
 
 type RagCache = Record<string, CacheEntry>;
 
-// 1. Утилита для получения MD5 хэша файла
 function getFileHash(filePath: string): string {
   const content = fs.readFileSync(filePath, "utf-8");
   return crypto.createHash("md5").update(content).digest("hex");
 }
 
-// 2. Рекурсивный обход папок
+// 👈 УЛУЧШЕННЫЙ РЕКУРСИВНЫЙ ОБХОД
 function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
   if (!fs.existsSync(dirPath)) return arrayOfFiles;
 
@@ -33,13 +32,14 @@ function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
   files.forEach((file) => {
     const fullPath = path.join(dirPath, file);
     if (fs.statSync(fullPath).isDirectory()) {
-      // Игнорируем ненужные папки
-      if (file !== "node_modules" && !file.startsWith(".")) {
+      // Игнорируем стандартные папки артефактов
+      if (!["node_modules", ".git", ".agent", "dist", "build", "__pycache__"].includes(file) && !file.startsWith(".")) {
         arrayOfFiles = getAllFiles(fullPath, arrayOfFiles);
       }
     } else {
-      // Берем только код
-      if (file.endsWith(".vue") || file.endsWith(".ts") || file.endsWith(".js")) {
+      // 👈 УНИВЕРСАЛЬНЫЙ СПИСОК РАСШИРЕНИЙ
+      const validExtensions = [".vue", ".ts", ".js", ".tsx", ".jsx", ".py", ".go", ".rs", ".json", ".md"];
+      if (validExtensions.includes(path.extname(file))) {
         arrayOfFiles.push(fullPath);
       }
     }
@@ -50,38 +50,53 @@ function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
 export async function getContextViaRAG(workDir: string, task: string): Promise<string> {
   const agentDir = path.join(workDir, ".agent");
   const cachePath = path.join(agentDir, "rag-cache.json");
-  const srcPath = path.join(workDir, "src");
+  
+  // 👈 ЗАГРУЗКА КОНФИГА
+  const config = loadAgentConfig(workDir);
 
   if (!fs.existsSync(agentDir)) fs.mkdirSync(agentDir, { recursive: true });
 
-  // 1. Загружаем кэш с диска
   let cache: RagCache = {};
   if (fs.existsSync(cachePath)) {
-    cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+    try {
+      cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+    } catch (e) {
+      cache = {};
+    }
   }
 
   const embeddingsModel = new HuggingFaceTransformersEmbeddings({
-    model: "Xenova/all-MiniLM-L6-v2", // Легкая и очень быстрая модель
+    model: "Xenova/all-MiniLM-L6-v2",
   });
 
-  const allFiles = getAllFiles(srcPath);
+  // 👈 СБОР ФАЙЛОВ ИЗ ВСЕХ ПАПОК КОНФИГА
+  let allFiles: string[] = [];
+  config.contextFiles.forEach(folder => {
+    const targetPath = path.join(workDir, folder);
+    if (fs.existsSync(targetPath)) {
+      // Если в конфиге указан конкретный файл, а не папка
+      if (fs.statSync(targetPath).isFile()) {
+        allFiles.push(targetPath);
+      } else {
+        allFiles = getAllFiles(targetPath, allFiles);
+      }
+    }
+  });
+
   const newCache: RagCache = {};
   let updatedFilesCount = 0;
 
-  console.log("🔍 [RAG] Проверка изменений в кодовой базе...");
+  console.log(`🔍 [RAG] Сканирование директорий: ${config.contextFiles.join(", ")}...`);
 
-  // 2. Проходим по всем файлам и сверяем дифф
   for (const file of allFiles) {
-    const relativePath = file.replace(workDir + "/", "");
+    const relativePath = path.relative(workDir, file);
     const currentHash = getFileHash(file);
 
-    // Если файл не менялся — берем из кэша
     if (cache[relativePath] && cache[relativePath].hash === currentHash) {
       newCache[relativePath] = cache[relativePath];
       continue;
     }
 
-    // Если файл новый или изменился — обрабатываем
     updatedFilesCount++;
     const content = fs.readFileSync(file, "utf-8");
     const doc = new Document({ pageContent: content, metadata: { source: relativePath } });
@@ -89,8 +104,8 @@ export async function getContextViaRAG(workDir: string, task: string): Promise<s
     const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
     const splittedDocs = await splitter.splitDocuments([doc]);
 
-    // Получаем векторы для новых чанков через API
-    const chunksData: { pageContent: string; metadata: any; vector: number[] }[] = [];    for (const chunk of splittedDocs) {
+    const chunksData: { pageContent: string; metadata: any; vector: number[] }[] = [];
+    for (const chunk of splittedDocs) {
       const vector = await embeddingsModel.embedQuery(chunk.pageContent);
       chunksData.push({
         pageContent: chunk.pageContent,
@@ -105,16 +120,12 @@ export async function getContextViaRAG(workDir: string, task: string): Promise<s
     };
   }
 
-  // 3. Сохраняем обновленный кэш (удаленные файлы исчезнут автоматически, так как их нет в newCache)
   fs.writeFileSync(cachePath, JSON.stringify(newCache));
 
   if (updatedFilesCount > 0) {
     console.log(`✅ [RAG] Обновлены векторы для ${updatedFilesCount} файлов.`);
-  } else {
-    console.log(`⚡️ [RAG] Изменений нет. Загрузка из кэша.`);
   }
 
-  // 4. Собираем все векторы и документы для поиска
   const allVectors: number[][] = [];
   const allDocuments: Document[] = [];
 
@@ -128,18 +139,17 @@ export async function getContextViaRAG(workDir: string, task: string): Promise<s
     }
   }
 
-  if (allDocuments.length === 0) return "Кодовая база пуста.";
+  if (allDocuments.length === 0) return "Кодовая база пуста в указанных директориях.";
 
-  // 5. Загружаем в быструю память и ищем
   const vectorStore = new MemoryVectorStore(embeddingsModel);
   await vectorStore.addVectors(allVectors, allDocuments);
 
-  console.log("🔍 [RAG] Ищем релевантный код под задачу...");
-  const results = await vectorStore.similaritySearch(task, 3);
+  console.log("🔍 [RAG] Поиск контекста...");
+  const results = await vectorStore.similaritySearch(task, 4); // Увеличил до 4 для большего контекста
 
   let contextStr = "";
   results.forEach((res, i) => {
-    contextStr += `\n--- ФРАГМЕНТ ${i + 1} ИЗ ФАЙЛА: ${res.metadata.source} ---\n${res.pageContent}\n`;
+    contextStr += `\n--- ФРАГМЕНТ ${i + 1} [ФАЙЛ: ${res.metadata.source}] ---\n${res.pageContent}\n`;
   });
 
   return contextStr;

@@ -1,66 +1,83 @@
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { AgentState } from "../state";
 
-export async function validatorNode(state: any) {
-  const { workDir, plan } = state; // ДОБАВЛЕНО: достаем план
+export async function validatorNode(state: typeof AgentState.State) {
+  // 👈 Теперь берем конфиг прямо из стейта, не читая диск лишний раз
+  const { workDir, plan, config, retryCount } = state;
 
   // --- 1. ОПТИМИЗАЦИЯ: Проверка типа действия ---
-  // ДОБАВЛЕНО: Если план пуст или последнее действие не меняло файлы — скипаем линт
   const lastStepRaw = plan && plan.length > 0 ? plan[0] : null;
   if (lastStepRaw) {
     const lastStep = JSON.parse(lastStepRaw);
-    // Пропускаем линт для действий, которые не меняют код
-    if (['read', 'test', 'terminal'].includes(lastStep.action)) {
-      console.log(`ℹ️ [Linter] Действие ${lastStep.action} не меняет код. Пропускаю.`);
-      return { ...state, isValidated: true };
+    const nonCodeActions = ['read', 'test', 'terminal', 'delete'];
+    
+    if (nonCodeActions.includes(lastStep.action)) {
+      console.log(`ℹ️ [Validator] Действие ${lastStep.action} не меняет код. Пропускаю.`);
+      return { isValidated: true };
     }
   }
 
-  const tsConfigPath = path.join(workDir, 'tsconfig.json');
-
-  if (!fs.existsSync(tsConfigPath)) {
-    console.log("ℹ️ [Linter] tsconfig.json не найден, пропускаю проверку типов.");
-    return { ...state, isValidated: true };
+  // Если команда линтера не задана — считаем, что всё ок
+  if (!config.linterCommand || config.linterCommand.trim() === "") {
+    console.log("ℹ️ [Validator] Команда валидации не задана. Пропускаю.");
+    return { isValidated: true };
   }
 
-  console.log("🛡️ [Linter] Запуск проверки типов (tsc)...");
+  // --- 2. УМНАЯ ПРОВЕРКА ДЛЯ TYPESCRIPT ---
+  // Если команда требует TS, но конфига нет — не спамим ошибками
+  if (config.linterCommand.includes("tsc")) {
+    const tsConfigPath = path.join(workDir, 'tsconfig.json');
+    if (!fs.existsSync(tsConfigPath)) {
+      console.log("⚠️ [Validator] Пропуск: tsc требует tsconfig.json, который отсутствует.");
+      return { isValidated: true };
+    }
+  }
+
+  console.log(`🛡️ [Validator] Запуск: ${config.linterCommand}`);
 
   try {
-    // ДОБАВЛЕНО: используем vue-tsc, если проект на Vue, иначе tsc
-    const linterCmd = fs.existsSync(path.join(workDir, 'node_modules', '.bin', 'vue-tsc')) 
-      ? 'npx vue-tsc --noEmit' 
-      : 'npx tsc --noEmit';
-
-    execSync(linterCmd, { cwd: workDir, stdio: 'pipe' });
+    execSync(config.linterCommand, { 
+      cwd: workDir, 
+      stdio: 'pipe',
+      shell: true 
+    } as any); 
     
-    return { ...state, isValidated: true, lintErrors: null };
-  } catch (error: any) {
-    let errorMessage = error.stdout?.toString() || error.message;
+    console.log("✅ [Validator] Код валиден.");
+    return { 
+      isValidated: true, 
+      lintErrors: null,
+      error: null // Сбрасываем системные ошибки, если линт прошел
+    };
 
-    // --- 2. ОПТИМИЗАЦИЯ: Фильтрация шума ---
-    // ДОБАВЛЕНО: Если мы знаем, какой файл правили, оставим только ошибки по нему
+  } catch (error: any) {
+    let errorMessage = error.stdout?.toString() || error.stderr?.toString() || error.message;
+
+    // --- 3. ФИЛЬТРАЦИЯ: Оставляем только важное ---
     if (lastStepRaw) {
         const lastStep = JSON.parse(lastStepRaw);
+        const fileName = path.basename(lastStep.file);
+        
         const fileLines = errorMessage.split('\n')
-            .filter((line: string) => line.includes(lastStep.file));
+            .filter((line: string) => line.toLowerCase().includes(fileName.toLowerCase()));
         
         if (fileLines.length > 0) {
-            errorMessage = "Найдены ошибки в измененном файле:\n" + fileLines.join('\n');
+            errorMessage = `Ошибка в файле ${lastStep.file}:\n${fileLines.join('\n')}`;
         }
     }
     
-    const logDir = path.join(workDir, '.agent', 'logs');
+    console.warn("⚠️ [Validator] Обнаружены ошибки.");
+
+    // Логируем для отладки в папку агента
+    const logDir = path.join(process.cwd(), '.agent', 'logs');
     if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
     fs.writeFileSync(path.join(logDir, 'last_lint_error.txt'), errorMessage);
 
     return { 
-      ...state, 
       isValidated: false, 
       lintErrors: errorMessage,
-      // ВАЖНО: retryCount увеличивается в shouldContinue или здесь, 
-      // убедись, что он не суммируется дважды
-      retryCount: (state.retryCount || 0) + 1 
+      retryCount: (retryCount || 0) + 1 
     };
   }
 }

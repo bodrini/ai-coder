@@ -3,12 +3,14 @@ import { AgentState } from "./state";
 import { plannerNode } from "./nodes/plannerNode";
 import { executorNode } from "./nodes/executorNode";
 import { validatorNode } from "./nodes/validatorNode";
+import { loadAgentConfig } from "./utils/configLoader";
+import * as path from "path";
 
 // 🛑 КОНСТАНТА: Максимальное количество попыток исправления
 const MAX_RETRIES = 3;
 
 /**
- * Определяет, нужно ли продолжать работу после валидации
+ * Определяет логику переходов: продолжать выполнение, исправлять ошибки или закончить.
  */
 function shouldContinue(state: typeof AgentState.State) {
   const { plan, error, lintErrors, retryCount } = state;
@@ -17,11 +19,10 @@ function shouldContinue(state: typeof AgentState.State) {
   // 1. ПРОВЕРКА НА ОШИБКИ (Системные или Линтера)
   if (error || lintErrors) {
     if (retries < MAX_RETRIES) {
-        console.log(`🚨 НАЙДЕНЫ ОШИБКИ (Попытка ${retries + 1}/${MAX_RETRIES}).`);
-        console.log(lintErrors ? "Причина: Ошибка валидации кода." : `Причина: ${error}`);
-        return "planner"; // Возвращаемся в планировщик, чтобы он учел ошибку
+        console.log(`🚨 [Retry] Обнаружена проблема (Попытка ${retries + 1}/${MAX_RETRIES}).`);
+        return "planner"; // Возвращаемся в планировщик для пересмотра стратегии
     } else {
-        console.error(`💀 ПРЕВЫШЕН ЛИМИТ ПОПЫТОК. Агент останавливается.`);
+        console.error(`💀 [Critical] Превышен лимит попыток исправления.`);
         return END;
     }
   }
@@ -31,23 +32,21 @@ function shouldContinue(state: typeof AgentState.State) {
     return "executor";
   }
 
-  // 3. ВСЕ ЗАДАЧИ ВЫПОЛНЕНЫ И ОШИБОК НЕТ
-  console.log("🏁 Все задачи выполнены успешно и проверены линтером.");
+  // 3. ВСЕ ЗАДАЧИ ВЫПОЛНЕНЫ
+  console.log("✅ [Done] Все задачи выполнены успешно и прошли валидацию.");
   return END;
 }
 
+// Сборка графа
 const workflow = new StateGraph(AgentState)
   .addNode("planner", plannerNode)
   .addNode("executor", executorNode)
-  .addNode("validator", validatorNode) // 👈 Добавляем узел валидации
+  .addNode("validator", validatorNode)
 
   .addEdge(START, "planner")
-  .addEdge("planner", "executor") // После плана идем к исполнителю (тут сработает пауза)
-  
-  // 🔥 ПОСЛЕ ИСПОЛНЕНИЯ ВСЕГДА ИДЕМ В ВАЛИДАТОР
+  .addEdge("planner", "executor") 
   .addEdge("executor", "validator") 
 
-  // 🔀 А УЖЕ ВАЛИДАТОР РЕШАЕТ ЧТО ДЕЛАТЬ ДАЛЬШЕ
   .addConditionalEdges(
     "validator",
     shouldContinue,
@@ -60,8 +59,58 @@ const workflow = new StateGraph(AgentState)
 
 const checkpointer = new MemorySaver();
 
-// 3. Компилируем с прерыванием ПЕРЕД исполнителем
 export const app = workflow.compile({
   checkpointer, 
-  interruptBefore: ["executor"] // 🛑 Пауза для Human-in-the-Loop перед записью кода
+  interruptBefore: ["executor"] // Пауза для подтверждения плана человеком
 });
+
+/**
+ * ТОЧКА ВХОДА
+ */
+async function run() {
+  // Получаем путь к проекту: npm start ../my-cool-project
+  const targetDir = process.argv[2];
+  const userTask = process.argv[3] || "Проанализируй проект и проверь его на ошибки";
+
+  if (!targetDir) {
+    console.error("❌ Ошибка: Укажите путь к целевому проекту первым аргументом.");
+    process.exit(1);
+  }
+
+  const workDir = path.resolve(targetDir);
+  
+  // 📂 Загружаем конфиг (локальный или глобальный)
+  const config = loadAgentConfig(workDir);
+  
+  console.log(`\n🤖 Агент инициализирован`);
+  console.log(`📍 Проект: ${workDir}`);
+  console.log(`🎭 Роль: ${config.role}`);
+  console.log(`🛠 Стек: ${config.techStack.join(", ")}\n`);
+
+  const configState = {
+    configurable: { thread_id: "session_" + Date.now() }
+  };
+
+  // Начальное состояние
+  const initialState = {
+    task: userTask,
+    workDir: workDir,
+    config: config, // Пробрасываем загруженный конфиг в стейт
+    plan: [],
+    retryCount: 0,
+    context: "",
+    error: null,
+    lintErrors: null,
+    isValidated: false
+  };
+
+  // Запуск цикла
+  // Примечание: так как стоит interruptBefore, здесь может потребоваться 
+  // дополнительная логика возобновления (resume) после подтверждения в CLI.
+  await app.invoke(initialState, configState);
+}
+
+// Запуск, если файл вызван напрямую
+if (require.main === module) {
+  run().catch(console.error);
+}
