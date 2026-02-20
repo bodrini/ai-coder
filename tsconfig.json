@@ -7,7 +7,6 @@
       "sourceMap": true,
       "outDir": "./dist",
       "moduleResolution": "Bundler",
-      "allowImportingTsExtensions": true,
       "removeComments": true,
       "noImplicitAny": false,
       "strictNullChecks": true,

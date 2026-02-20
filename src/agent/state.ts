@@ -12,6 +12,16 @@ export const AgentState = Annotation.Root({
     default: () => "",
   }),
   error: Annotation<string>(),
+  // 🔥 НОВЫЕ ПОЛЯ ДЛЯ ВАЛИДАЦИИ
+  lintErrors: Annotation<string | null>({
+    reducer: (x, y) => y,
+    default: () => null,
+  }),
+
+  isValidated: Annotation<boolean>({
+    reducer: (x, y) => y,
+    default: () => false,
+  }),
   retryCount: Annotation<number>({
     reducer: (current, update) => update,
     default: () => 0,

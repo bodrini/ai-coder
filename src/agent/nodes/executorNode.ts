@@ -5,13 +5,13 @@ import fs from "fs";
 import { AgentState } from "../state";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import * as dotenv from "dotenv";
-import { loadPrompt } from "../utils/promptLoader"; // 1. Импортируем загрузчик
+import { loadPrompt } from "../utils/promptLoader";
 
 dotenv.config();
 
 const execAsync = promisify(exec);
 
-// НАСТРОЙКА GEMINI
+// Сменили на 1.5-flash для более высоких лимитов (15 зап/мин)
 const geminiCoder = new ChatGoogleGenerativeAI({
   model: "gemini-2.5-flash", 
   apiKey: process.env.GEMINI_API_KEY,
@@ -21,18 +21,15 @@ const geminiCoder = new ChatGoogleGenerativeAI({
 export async function executorNode(state: typeof AgentState.State) {
   console.log("--- ЭТАП: ВЫПОЛНЕНИЕ (Gemini) ---");
 
-  const currentPlan = state.plan;
+  const { plan, workDir, context, retryCount, lintErrors } = state;
 
-  if (!currentPlan || currentPlan.length === 0) {
+  if (!plan || plan.length === 0) {
     return { plan: [] };
   }
 
-  const taskJson = currentPlan[0];
+  const taskJson = plan[0];
   const task = JSON.parse(taskJson);
-
-  const workingDirectory = state.workDir;
-  const currentContext = state.context || ""; 
-  const currentRetries = state.retryCount || 0;
+  const workingDirectory = workDir;
   
   let newContextData = "";
   let resultOutput = ""; 
@@ -56,92 +53,80 @@ export async function executorNode(state: typeof AgentState.State) {
         resultOutput = stdout;
 
       } catch (cmdError: any) {
-        console.error("💥 ОШИБКА В ТЕРМИНАЛЕ! (+1 к попыткам)");
+        console.error("💥 ОШИБКА В ТЕРМИНАЛЕ!");
         return {
-          plan: [], 
-          error: `Ошибка выполнения команды '${task.description}': ${cmdError.message || cmdError.stderr}`,
-          context: newContextData,
-          retryCount: currentRetries + 1
+          error: `Ошибка команды: ${cmdError.message || cmdError.stderr}`,
+          retryCount: (retryCount || 0) + 1
         };
       }
 
     // --- ВЕТКА B: GEMINI ---
     } else if (task.tool === "gemini") {
-      
       const fullFilePath = path.join(workingDirectory, task.file);
 
       // 1. READ (Чтение)
       if (task.action === "read") {
         console.log(`👀 Читаю файл: ${task.file}`);
-        try {
-          if (fs.existsSync(fullFilePath)) {
-            const content = fs.readFileSync(fullFilePath, 'utf-8');
-            resultOutput = `Файл прочитан.`;
-            newContextData = `\n=== КОНТЕКСТ ФАЙЛА ${task.file} ===\n${content}\n`;
-          } else {
-            resultOutput = `Файл ${task.file} не найден.`;
-            console.log("⚠️ Файл не найден.");
-          }
-        } catch (e) {
-          resultOutput = `Ошибка чтения: ${e}`;
+        if (fs.existsSync(fullFilePath)) {
+          const content = fs.readFileSync(fullFilePath, 'utf-8');
+          resultOutput = `Файл прочитан.`;
+          newContextData = `\n=== КОНТЕКСТ ФАЙЛА ${task.file} ===\n${content}\n`;
+        } else {
+          resultOutput = `Файл ${task.file} не найден.`;
         }
       }
 
       // 2. EDIT / CREATE (Изменение кода)
       else if (task.action === "edit" || task.action === "create") {
-        
         let fileContent = "";
-        try {
-          if (fs.existsSync(fullFilePath)) {
-             fileContent = fs.readFileSync(fullFilePath, 'utf-8');
-          }
-        } catch (e) { console.log("Файл новый."); }
+        if (fs.existsSync(fullFilePath)) {
+          fileContent = fs.readFileSync(fullFilePath, 'utf-8');
+        }
 
-        // 2. ЗАГРУЖАЕМ ПРОМПТ ИЗ ФАЙЛА executor.md
         const prompt = loadPrompt("executor.md", {
             description: task.description,
             file: task.file,
-            context: currentContext,
+            context: (context || "") + (lintErrors ? `\n⚠️ ОШИБКИ ЛИНТЕРА:\n${lintErrors}` : ""),
             fileContent: fileContent
         });
 
         const response = await geminiCoder.invoke(prompt);
         const rawText = response.content as string;
 
-        // Очистка от маркдауна (```vue и т.д.)
         resultOutput = rawText
-          .replace(/```vue/g, "")
-          .replace(/```html/g, "")
-          .replace(/```typescript/g, "")
-          .replace(/```ts/g, "")
+          .replace(/```(vue|html|typescript|ts|javascript|js|json|css|scss)/g, "")
           .replace(/```/g, "")
           .trim();
 
-        // Создаем папку, если её нет
         const dir = path.dirname(fullFilePath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-        // Записываем файл
         fs.writeFileSync(fullFilePath, resultOutput);
-        console.log(`✅ Файл сохранен: ${fullFilePath}`);
+        console.log(`✅ Файл сохранен: ${task.file}`);
       }
     }
 
-  } catch (error: any) {
-    console.error(`❌ Критическая ошибка Исполнителя: ${error}`);
+    // ✅ УСПЕШНОЕ ВЫПОЛНЕНИЕ ШАГА
     return {
-      plan: [],
+      plan: plan.slice(1),
+      currentCode: resultOutput,
+      context: newContextData,
+      error: null,
+      lintErrors: null,
+      isValidated: false
+    };
+
+  } catch (error: any) {
+    // --- ОБРАБОТКА ОШИБОК И ЛИМИТОВ ---
+    if (error.message?.includes('429')) {
+      console.log("⏳ [!] Превышен лимит запросов (429). Сплю 30 секунд перед повтором...");
+      await new Promise(resolve => setTimeout(resolve, 30000));
+    }
+
+    console.error(`❌ Критическая ошибка Исполнителя: ${error.message}`);
+    return {
       error: `System Error: ${error.message || String(error)}`,
-      retryCount: currentRetries + 1
+      retryCount: (retryCount || 0) + 1
     };
   }
-
-  // ✅ УСПЕХ
-  return {
-    plan: currentPlan.slice(1),
-    currentCode: resultOutput,
-    context: newContextData,
-    error: "", 
-    retryCount: 0 
-  };
 }
