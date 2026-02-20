@@ -3,7 +3,8 @@ import path from "path";
 import fs from "fs";
 import * as dotenv from "dotenv";
 import { setupLogger } from "./agent/utils/logger";
-import * as readline from "readline/promises"; // 👈 Импортируем для запроса в консоли
+import { loadAgentConfig } from "./agent/utils/configLoader";
+import * as readline from "readline/promises";
 
 dotenv.config();
 
@@ -13,118 +14,115 @@ function getHistoryPath(targetFolder: string) {
 
 async function main() {
   setupLogger();
-  const targetFolder = process.env.TARGET_PROJECT_PATH || process.cwd();
+  
+  // Приоритет пути: Аргумент CLI > .env > Текущая папка
+  const targetFolder = process.argv[2] || process.env.TARGET_PROJECT_PATH || process.cwd();
   const taskFilePath = path.join(process.cwd(), "task.md");
 
-  // 1. Проверяем, есть ли файл с задачей
   if (!fs.existsSync(taskFilePath)) {
-    console.error("❌ Ошибка: Файл task.md не найден в корне проекта!");
+    console.error("❌ Ошибка: Файл task.md не найден в корне агента!");
     process.exit(1);
   }
 
-  // 2. Читаем задачу из файла
   const userTask = fs.readFileSync(taskFilePath, "utf-8").trim();
-
-  if (!userTask) {
-    console.error("❌ Ошибка: Файл task.md пустой!");
-    process.exit(1);
-  }
-
-  // 3. Работа с историей
   const historyFile = getHistoryPath(targetFolder);
   let projectHistory = "Это первый запуск агента.";
 
   if (fs.existsSync(historyFile)) {
     projectHistory = fs.readFileSync(historyFile, "utf-8");
-    console.log("🧠 История проекта загружена.");
   }
 
-  console.log("\n🤖 **AI VUE AGENT ЗАПУЩЕН**");
-  console.log(`📂 Рабочая директория: ${targetFolder}`);
-  console.log("-----------------------------------");
-  console.log(`📝 Задача из файла:\n${userTask}`);
-  console.log("-----------------------------------\n");
+  // Загружаем универсальный конфиг из целевого проекта
+  const agentConfig = loadAgentConfig(targetFolder);
+
+  console.log("\n🤖 **AI AGENT ЗАПУЩЕН**");
+  console.log(`🎭 Роль: ${agentConfig.role}`);
+  console.log(`🛠 Стек: ${agentConfig.techStack.join(", ")}`);
+  console.log(`📍 Проект: ${targetFolder}\n`);
 
   const inputs = {
     workDir: targetFolder, 
     task: userTask,
+    config: agentConfig,
     plan: [],
     files: [],
     retryCount: 0,
     memory: projectHistory,
+    error: null,
+    lintErrors: null,
+    currentCode: "",
+    isValidated: false
   };
 
-  // 🔥 КОНФИГ СЕССИИ (Обязателен для прерываний LangGraph)
-  // Используем Date.now(), чтобы каждый запуск был новой независимой сессией
-  const config = { configurable: { thread_id: `agent-session-${Date.now()}` } };
+  // Уникальный thread_id позволяет сохранять состояние между инвоками
+  const sessionConfig = { configurable: { thread_id: `session-${Date.now()}` } };
 
   try {
-    console.log("⏳ Планировщик изучает проект и составляет план...");
+    console.log("⏳ Планировщик изучает проект и составляет стратегию...");
+    await app.invoke(inputs, sessionConfig);
+
+    let currentState = await app.getState(sessionConfig);
     
-    // Шаг 1: Запускаем граф. Он остановится ПЕРЕД узлом "executor"
-    await app.invoke(inputs, config);
-
-    // Шаг 2: Получаем текущее состояние (после остановки)
-    let currentState = await app.getState(config);
-    const nextNode = currentState.next;
-
-    // Шаг 3: Проверяем, действительно ли мы стоим на паузе перед Исполнителем
-    if (nextNode && nextNode.includes("executor")) {
+    // Проверка на прерывание перед исполнением (interruptBefore: ["executor"])
+    if (currentState.next && currentState.next.includes("executor")) {
       const plan = currentState.values.plan;
 
-      // Выводим план
       console.log("\n======================================");
-      console.log("📋 СГЕНЕРИРОВАННЫЙ ПЛАН:");
+      console.log("📋 ПЛАН ДЕЙСТВИЙ:");
       console.log("======================================");
-      
-      plan.forEach((stepJson: string, index: number) => {
+      plan.forEach((stepJson: string, i: number) => {
         try {
           const step = JSON.parse(stepJson);
-          console.log(`Шаг ${index + 1}: [${step.tool.toUpperCase()}] -> ${step.action} ${step.file ? `(${step.file})` : ''}`);
-          console.log(`   📝 Описание: ${step.description}\n`);
+          console.log(`${i+1}. [${step.tool.toUpperCase()}] ${step.action}: ${step.description}`);
         } catch (e) {
-          console.log(`Шаг ${index + 1}: ${stepJson}`);
+          console.log(`${i+1}. ${stepJson}`);
         }
       });
 
-      // Спрашиваем пользователя
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const answer = await rl.question("🚀 Выполнить этот план? (y - да, n - отмена): ");
+      const answer = await rl.question("\n🚀 Выполнить этот план? (y/n): ");
       rl.close();
 
       if (answer.toLowerCase() === 'y') {
-        console.log("\n⚡️ План утвержден. Начинаю выполнение...");
-        
-        // 🔥 МАГИЧЕСКИЙ ЦИКЛ 🔥
-        // Крутим invoke(null), пока граф не завершит все оставшиеся шаги (пока не опустеет next)
-        while (currentState.next && currentState.next.length > 0) {
-            await app.invoke(null, config); // Передаем null, так как inputs уже в стейте
-            currentState = await app.getState(config); // Обновляем состояние для проверки
-        }
-        
-        // 4. ЕСЛИ УСПЕХ -> СОХРАНЯЕМ В ИСТОРИЮ
-        console.log("\n💾 Сохраняю результат в память...");
-        const agentDir = path.dirname(historyFile);
-        if (!fs.existsSync(agentDir)) {
-          fs.mkdirSync(agentDir, { recursive: true });
-        }
+        console.log("\n⚡️ Начинаю выполнение плана...");
 
-        const timestamp = new Date().toISOString().split('T')[0];
-        const newEntry = `\n## [${timestamp}] Задача\n${userTask}\nStatus: ✅ Completed\n`;
-        fs.appendFileSync(historyFile, newEntry);
-        console.log(`✅ История обновлена: ${historyFile}`); 
+        // 🔥 МАГИЧЕСКИЙ ЦИКЛ: Крутим, пока есть следующие узлы в графе
+        while (currentState.next && currentState.next.length > 0) {
+            // Если в стейте есть ошибка, которую планировщик не смог разрулить — выходим
+            if (currentState.values.error && (currentState.values.retryCount || 0) >= 3) {
+                console.error("\n🛑 Остановка: Превышено количество попыток исправления ошибок.");
+                break;
+            }
+
+            // Вызываем invoke(null), чтобы продолжить с текущей точки
+            await app.invoke(null, sessionConfig);
+            
+            // Получаем обновленное состояние после прохода через узлы
+            currentState = await app.getState(sessionConfig);
+            
+            // Если план пуст и ошибок нет — мы закончили
+            if (!currentState.next || currentState.next.length === 0) {
+                break;
+            }
+        }
         
-        console.log("\n🏁 Готово! Агент успешно завершил работу.");
+        // 💾 Сохранение истории после завершения всех шагов
+        const timestamp = new Date().toLocaleString();
+        const entry = `\n---\n### [${timestamp}] Задача\n${userTask}\n**Статус:** ✅ Успешно выполнено\n`;
+        
+        const agentDir = path.dirname(historyFile);
+        if (!fs.existsSync(agentDir)) fs.mkdirSync(agentDir, { recursive: true });
+        fs.appendFileSync(historyFile, entry);
+        
+        console.log("\n🏁 Работа завершена. Все шаги плана выполнены и проверены.");
       } else {
-        console.log("\n❌ Выполнение отменено пользователем. Граф остановлен.");
+        console.log("\n❌ Отменено пользователем. Изменения не были применены.");
       }
     } else {
-       // Если план пустой или Планировщик сам завершил работу с ошибкой
-       console.log("\n🏁 Агент завершил работу до этапа выполнения (возможно, план пуст или произошла ошибка).");
+       console.log("\n🏁 Агент завершил работу (план пуст или задача выполнена информационно).");
     }
-
   } catch (error) {
-    console.error("\n💥 Произошла ошибка при выполнении:", error);
+    console.error("\n💥 Критическая ошибка при работе агента:", error);
   }
 }
 

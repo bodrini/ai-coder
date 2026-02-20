@@ -11,7 +11,7 @@ dotenv.config();
 
 const execAsync = promisify(exec);
 
-// Сменили на 1.5-flash для более высоких лимитов (15 зап/мин)
+// Используем 1.5-flash для работы с кодом (более высокие лимиты запросов)
 const geminiCoder = new ChatGoogleGenerativeAI({
   model: "gemini-2.5-flash", 
   apiKey: process.env.GEMINI_API_KEY,
@@ -21,7 +21,8 @@ const geminiCoder = new ChatGoogleGenerativeAI({
 export async function executorNode(state: typeof AgentState.State) {
   console.log("--- ЭТАП: ВЫПОЛНЕНИЕ (Gemini) ---");
 
-  const { plan, workDir, context, retryCount, lintErrors } = state;
+  // 👈 Извлекаем config из стейта
+  const { plan, workDir, context, retryCount, lintErrors, config } = state;
 
   if (!plan || plan.length === 0) {
     return { plan: [] };
@@ -44,6 +45,7 @@ export async function executorNode(state: typeof AgentState.State) {
     // --- ВЕТКА A: ТЕРМИНАЛ ---
     if (task.tool === "terminal") {
       try {
+        // Команды теперь более гибкие (можно расширить логику под разные менеджеры пакетов)
         const command = task.action === "test" ? "npm test" 
                       : task.action === "build" ? "npm run build" 
                       : task.description;
@@ -83,18 +85,22 @@ export async function executorNode(state: typeof AgentState.State) {
           fileContent = fs.readFileSync(fullFilePath, 'utf-8');
         }
 
+        // 👈 ПЕРЕДАЕМ ДАННЫЕ ИЗ КОНФИГА В ПРОМПТ ИСПОЛНИТЕЛЯ
         const prompt = loadPrompt("executor.md", {
+            projectType: config.projectType, // Теперь Executor знает, что он во Vue или Node
+            techStack: config.techStack.join(", "),
             description: task.description,
             file: task.file,
-            context: (context || "") + (lintErrors ? `\n⚠️ ОШИБКИ ЛИНТЕРА:\n${lintErrors}` : ""),
+            context: (context || "") + (lintErrors ? `\n⚠️ ОШИБКИ ВАЛИДАЦИИ:\n${lintErrors}` : ""),
             fileContent: fileContent
         });
 
         const response = await geminiCoder.invoke(prompt);
         const rawText = response.content as string;
 
+        // Расширенная очистка от маркдауна (добавили типичные расширения)
         resultOutput = rawText
-          .replace(/```(vue|html|typescript|ts|javascript|js|json|css|scss)/g, "")
+          .replace(/```(vue|html|typescript|ts|javascript|js|json|css|scss|python|py|go|rust|rs)/g, "")
           .replace(/```/g, "")
           .trim();
 
@@ -112,14 +118,14 @@ export async function executorNode(state: typeof AgentState.State) {
       currentCode: resultOutput,
       context: newContextData,
       error: null,
-      lintErrors: null,
-      isValidated: false
+      lintErrors: null, // Сбрасываем ошибки, так как мы сделали шаг к их исправлению
+      isValidated: false // Отправляем на проверку в ValidatorNode
     };
 
   } catch (error: any) {
     // --- ОБРАБОТКА ОШИБОК И ЛИМИТОВ ---
     if (error.message?.includes('429')) {
-      console.log("⏳ [!] Превышен лимит запросов (429). Сплю 30 секунд перед повтором...");
+      console.log("⏳ [!] Превышен лимит запросов (429). Сплю 30 секунд...");
       await new Promise(resolve => setTimeout(resolve, 30000));
     }
 

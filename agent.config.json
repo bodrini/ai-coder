@@ -1,0 +1,13 @@
+{
+    "projectType": "General TypeScript",
+    "role": "Senior Fullstack Engineer",
+    "linterCommand": "npx tsc --noEmit",
+    "contextFiles": ["src", "lib"],
+    "techStack": ["TypeScript", "Node.js", "ESLint"],
+    "rules": [
+      "Пиши чистый, самодокументированный код",
+      "Соблюдай строгую типизацию, избегай использования 'any'",
+      "Используй современные стандарты ECMAScript (ES6+)",
+      "Если в проекте есть существующие паттерны, следуй им"
+    ]
+  }
